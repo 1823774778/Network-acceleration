@@ -1,0 +1,145 @@
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -207,6 +207,11 @@
+ struct neigh_parms;
+ struct sk_buff;
+ 
++#ifdef CONFIG_SHORTCUT_FE
++/* A nonzero result means the callback consumed the skb. Protected by RCU. */
++extern int (*athrs_fast_nat_recv)(struct sk_buff *skb) __rcu;
++#endif
++
+ struct netdev_hw_addr {
+ 	struct list_head	list;
+ 	struct rb_node		node;
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -873,6 +873,10 @@
+ #endif
+ 	__u8			slow_gro:1;
+ 
++#ifdef CONFIG_SHORTCUT_FE
++	__u8			fast_forwarded:1;
++#endif
++
+ #ifdef CONFIG_NET_SCHED
+ 	__u16			tc_index;	/* traffic control index */
+ #endif
+--- a/include/net/netfilter/nf_sfe.h
++++ b/include/net/netfilter/nf_sfe.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _NET_NF_SFE_H
++#define _NET_NF_SFE_H
++
++struct notifier_block;
++
++/* Atomic callbacks receive a borrowed nf_conn pointer and must not sleep. */
++int nf_sfe_register_destroy_notifier(struct notifier_block *nb);
++void nf_sfe_unregister_destroy_notifier(struct notifier_block *nb);
++
++#endif
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -447,6 +447,15 @@
+ 	  migration of VMs with direct attached VFs by failing over to the
+ 	  paravirtual datapath when the VF is unplugged.
+ 
++config SHORTCUT_FE
++	bool "Shortcut Forwarding Engine receive hook"
++	depends on INET
++	help
++	  Provide the receive callback and skb forwarding marker used by the
++	  external QSDK Shortcut Forwarding Engine module. The callback runs
++	  after ingress processing and VLAN device resolution. Leave disabled
++	  unless the matching SFE module is built for this kernel.
++
+ config ETHTOOL_NETLINK
+ 	bool "Netlink interface for ethtool"
+ 	default y
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -5193,6 +5193,11 @@
+ }
+ EXPORT_SYMBOL_GPL(netdev_rx_handler_unregister);
+ 
++#ifdef CONFIG_SHORTCUT_FE
++int (*athrs_fast_nat_recv)(struct sk_buff *skb) __rcu __read_mostly;
++EXPORT_SYMBOL_GPL(athrs_fast_nat_recv);
++#endif
++
+ /*
+  * Limit the use of PFMEMALLOC reserves to those protocols that implement
+  * the special handling of PFMEMALLOC skbs.
+@@ -5328,6 +5333,25 @@
+ 			goto out;
+ 	}
+ 
++#ifdef CONFIG_SHORTCUT_FE
++	/* Preserve ingress policy, VLAN resolution and packet tap delivery. */
++	if (!pfmemalloc) {
++		int (*fast_recv)(struct sk_buff *skb);
++
++		fast_recv = rcu_dereference(athrs_fast_nat_recv);
++		if (fast_recv) {
++			if (pt_prev) {
++				ret = deliver_skb(skb, pt_prev, orig_dev);
++				pt_prev = NULL;
++			}
++			if (fast_recv(skb)) {
++				ret = NET_RX_SUCCESS;
++				goto out;
++			}
++		}
++	}
++#endif
++
+ 	rx_handler = rcu_dereference(skb->dev->rx_handler);
+ 	if (rx_handler) {
+ 		if (pt_prev) {
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -26,6 +26,7 @@
+ #include <linux/percpu.h>
+ #include <linux/moduleparam.h>
+ #include <linux/notifier.h>
++#include <net/netfilter/nf_sfe.h>
+ #include <linux/kernel.h>
+ #include <linux/netdevice.h>
+ #include <linux/socket.h>
+@@ -674,6 +675,23 @@
+ 	local_bh_enable();
+ }
+ 
++#ifdef CONFIG_SHORTCUT_FE
++/* A separate observer for SFE; ctnetlink retains its existing notifier slot. */
++static ATOMIC_NOTIFIER_HEAD(nf_sfe_destroy_chain);
++
++int nf_sfe_register_destroy_notifier(struct notifier_block *nb)
++{
++	return atomic_notifier_chain_register(&nf_sfe_destroy_chain, nb);
++}
++EXPORT_SYMBOL_GPL(nf_sfe_register_destroy_notifier);
++
++void nf_sfe_unregister_destroy_notifier(struct notifier_block *nb)
++{
++	atomic_notifier_chain_unregister(&nf_sfe_destroy_chain, nb);
++}
++EXPORT_SYMBOL_GPL(nf_sfe_unregister_destroy_notifier);
++#endif
++
+ bool nf_ct_delete(struct nf_conn *ct, u32 portid, int report)
+ {
+ 	struct nf_conn_tstamp *tstamp;
+@@ -682,6 +700,11 @@
+ 	if (test_and_set_bit(IPS_DYING_BIT, &ct->status))
+ 		return false;
+ 
++#ifdef CONFIG_SHORTCUT_FE
++	/* Notify once, even when no netlink event-cache extension exists. */
++	atomic_notifier_call_chain(&nf_sfe_destroy_chain, 1U << IPCT_DESTROY, ct);
++#endif
++
+ 	tstamp = nf_conn_tstamp_find(ct);
+ 	if (tstamp) {
+ 		s32 timeout = ct->timeout - nfct_time_stamp;

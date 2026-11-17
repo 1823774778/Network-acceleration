@@ -1,0 +1,14 @@
+--- a/src/kernel/sfe_cm.c	2026-11-18 07:15:04.952928487 +0800
++++ b/src/kernel/sfe_cm.c	2026-11-18 07:15:04.952928487 +0800
+@@ -276,7 +276,11 @@
+ 	 * neighbours are routers too.
+ 	 */
+ 	if (likely(is_v4)) {
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0))
+ 		rt = ip_route_output(&init_net, addr->ip, 0, 0, 0, RT_SCOPE_UNIVERSE);
++#else
++		rt = ip_route_output(&init_net, addr->ip, 0, 0, 0);
++#endif
+ 		if (unlikely(IS_ERR(rt))) {
+ 			goto ret_fail;
+ 		}
