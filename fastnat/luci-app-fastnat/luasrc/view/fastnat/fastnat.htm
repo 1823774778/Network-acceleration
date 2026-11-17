@@ -1,0 +1,265 @@
+<%+header%>
+<% local json = require "luci.jsonc" %>
+<link rel="stylesheet" href="<%=resource%>/fastnat/fastnat.css">
+<style>
+.switch input:disabled + .slider { opacity:.55; cursor:not-allowed; }
+.switch input:focus-visible + .slider { outline:2px solid #2196f3; outline-offset:3px; }
+.fastnat-state { display:flex; align-items:center; gap:8px; }
+.fastnat-dot { width:8px; height:8px; border-radius:50%; background:#9ca3af; }
+.fastnat-engine-desc { margin:0 0 16px; line-height:1.7; }
+.fastnat-counter { font-variant-numeric:tabular-nums; overflow-wrap:anywhere; min-width:0; }
+</style>
+
+<div class="fwx-form-card">
+  <div class="form-title"><%:Fastnat%></div>
+  <div class="form-desc fastnat-engine-desc"><%:Improves NAT forwarding performance. It may conflict with some services.%></div>
+  <div class="form-row">
+    <label class="form-label" for="fastnat-enabled"><%:Acceleration Engine%></label>
+    <label class="switch">
+      <input type="checkbox" id="fastnat-enabled" disabled>
+      <span class="slider"></span>
+    </label>
+  </div>
+  <div id="fastnat-details" style="display:none">
+    <div class="form-row">
+      <label class="form-label" for="fastnat-dpi-compat"><%:DPI Compatibility%></label>
+      <label class="switch">
+        <input type="checkbox" id="fastnat-dpi-compat" disabled>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="form-row">
+      <span class="form-label"><%:Engine Status%></span>
+      <div class="fastnat-state" role="status">
+        <span class="fastnat-dot" id="fastnat-dot" aria-hidden="true"></span>
+        <span id="fastnat-status"><%:Loading...%></span>
+      </div>
+    </div>
+    <div class="form-row">
+      <span class="form-label"><%:Currently Accelerated Connections%></span>
+      <span class="fastnat-counter" id="total-connections">--</span>
+    </div>
+    <div class="form-row">
+      <span class="form-label"><%:Accelerated Packets%></span>
+      <span class="fastnat-counter" id="accelerated-packets">--</span>
+    </div>
+    <div class="form-row">
+      <span class="form-label"><%:Accelerated Traffic%></span>
+      <span class="fastnat-counter" id="accelerated-bytes">--</span>
+    </div>
+  </div>
+</div>
+
+<script src="<%=resource%>/fastnat/fastnat-ui.js"></script>
+<script>
+(function() {
+  var status_url = '<%=url("admin/network/fastnat_status")%>';
+  var config_url = '<%=url("admin/network/fastnat_config")%>';
+  var token = <%=json.stringify(luci.dispatcher.context.authtoken or "")%>;
+  var running = '<%:Running%>';
+  var disabled = '<%:Disabled%>';
+  var not_loaded = '<%:Acceleration module is not loaded%>';
+  var load_failed = '<%:Failed to load status%>';
+  var save_failed = '<%:Failed to apply acceleration setting%>';
+  var saving_text = '<%:Applying...%>';
+  var saved_text = '<%:Saved successfully%>';
+  var confirm_text = '<%:Confirm%>';
+  var cancel_text = '<%:Cancel%>';
+  var dpi_warning = '<%:Disabling this will affect application identification and application filtering. Are you sure you want to disable it?%>';
+  var timer = null;
+  var request = null;
+  var saving = false;
+  var confirming = false;
+  var loaded = false;
+  var load_error = false;
+  var active = true;
+
+  var elEnabled = document.getElementById('fastnat-enabled');
+  var elDpi = document.getElementById('fastnat-dpi-compat');
+  var elDetails = document.getElementById('fastnat-details');
+  var elStatus = document.getElementById('fastnat-status');
+  var elDot = document.getElementById('fastnat-dot');
+  var elConn = document.getElementById('total-connections');
+  var elPkts = document.getElementById('accelerated-packets');
+  var elBytes = document.getElementById('accelerated-bytes');
+
+  function number_text(value, grouped) {
+    var text = String(value == null ? '0' : value);
+    if (!/^\d+$/.test(text)) return '--';
+    return grouped === false ? text : text.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
+  function traffic_text(value) {
+    var text = String(value == null ? '0' : value);
+    if (!/^\d+$/.test(text)) return '--';
+    var bytes = Number(text);
+    if (!isFinite(bytes)) return '--';
+    var units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB'];
+    var unit = 0;
+    while (bytes >= 1024 && unit < units.length - 1) {
+      bytes /= 1024;
+      unit++;
+    }
+    return bytes.toFixed(unit >= 2 ? 1 : 0).replace(/\.0$/, '') + ' ' + units[unit];
+  }
+
+  function message(text, error) {
+    showCommonModal(text, error ? 2500 : 1000, error ? 'error' : 'success');
+  }
+
+  function setDisabled(flag) {
+    elEnabled.disabled = flag;
+    elDpi.disabled = flag;
+  }
+
+  function render(data) {
+    loaded = data.loaded === true;
+    var enabled = loaded && data.enabled === true;
+    elEnabled.checked = loaded ? enabled : data.configured_enabled === true;
+    elEnabled.disabled = saving || confirming || !loaded;
+    elDetails.style.display = enabled ? '' : 'none';
+    elDpi.checked = loaded ? data.dpi_compat === true : data.configured_dpi_compat === true;
+    elDpi.disabled = saving || confirming || !enabled;
+    elStatus.textContent = !loaded ? not_loaded : (enabled ? running : disabled);
+    elDot.style.background = enabled ? '#22c55e' : '#9ca3af';
+    var totals = data.totals || {};
+    elConn.textContent = data.stats_available ? number_text(totals.total_connections) : '--';
+    elPkts.textContent = data.stats_available ? number_text(totals.accelerated_packets, false) : '--';
+    elBytes.textContent = data.stats_available ? traffic_text(totals.accelerated_bytes) : '--';
+  }
+
+  function schedule_refresh() {
+    clearTimeout(timer);
+    if (active && !saving && !confirming) timer = setTimeout(refresh, 5000);
+  }
+
+  function status_error() {
+    setDisabled(true);
+    elStatus.textContent = load_failed;
+    elDot.style.background = '#9ca3af';
+    if (!load_error) message(load_failed, true);
+    load_error = true;
+  }
+
+  function ajax(opts) {
+    var xhr = new XMLHttpRequest();
+    var done = false;
+    var timeout = setTimeout(function() {
+      if (done) return;
+      done = true;
+      xhr.abort();
+      if (opts.fail) opts.fail('timeout');
+      if (opts.always) opts.always();
+    }, opts.timeout || 10000);
+
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState !== 4 || done) return;
+      done = true;
+      clearTimeout(timeout);
+      var resp = null;
+      try { resp = JSON.parse(xhr.responseText); } catch (e) { resp = null; }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        if (opts.done) opts.done(resp);
+      } else if (opts.fail) {
+        opts.fail(xhr.status, resp);
+      }
+      if (opts.always) opts.always();
+    };
+
+    xhr.open(opts.type || 'GET', opts.url, true);
+    if (opts.type === 'POST') {
+      xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
+    }
+    xhr.send(opts.data || null);
+    return xhr;
+  }
+
+  function refresh() {
+    if (!active || saving || confirming) return;
+    request = ajax({
+      url: status_url + (status_url.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now(),
+      timeout: 10000,
+      done: function(resp) {
+        if (resp && resp.code === 2000 && resp.data) {
+          load_error = false;
+          render(resp.data);
+        } else {
+          status_error();
+        }
+      },
+      fail: function(status) {
+        if (status !== 'abort') status_error();
+      },
+      always: function() { request = null; schedule_refresh(); }
+    });
+  }
+
+  function pause_refresh() {
+    clearTimeout(timer);
+    if (request) request.abort();
+    setDisabled(true);
+  }
+
+  function save_config() {
+    if (!active || saving || !loaded) return;
+    saving = true;
+    pause_refresh();
+    var enabled = elEnabled.checked ? '1' : '0';
+    var dpi_compat = elDpi.checked ? '1' : '0';
+    if (enabled === '0') elDetails.style.display = 'none';
+    elStatus.textContent = saving_text;
+    ajax({
+      url: config_url,
+      type: 'POST',
+      timeout: 30000,
+      data: 'enabled=' + enabled + '&dpi_compat=' + dpi_compat + '&token=' + encodeURIComponent(token),
+      done: function(resp) {
+        if (resp && resp.code === 2000 && resp.data) {
+          render(resp.data);
+          message(saved_text, false);
+        } else {
+          message((resp && resp.message) || save_failed, true);
+        }
+      },
+      fail: function(status, resp) {
+        message((resp && resp.message) || save_failed, true);
+      },
+      always: function() {
+        saving = false;
+        refresh();
+      }
+    });
+  }
+
+  function onChange() {
+    if (saving || confirming || !loaded) return;
+    if (this.id === 'fastnat-dpi-compat' && !this.checked) {
+      this.checked = true;
+      confirming = true;
+      pause_refresh();
+      showConfirmModal(dpi_warning, function() {
+        confirming = false;
+        elDpi.checked = false;
+        save_config();
+      }, function() {
+        confirming = false;
+        setDisabled(!loaded);
+        schedule_refresh();
+      }, confirm_text, cancel_text);
+      return;
+    }
+    save_config();
+  }
+
+  elEnabled.addEventListener('change', onChange);
+  elDpi.addEventListener('change', onChange);
+
+  window.addEventListener('pagehide', function() {
+    active = false;
+    clearTimeout(timer);
+    if (request) request.abort();
+  });
+  refresh();
+})();
+</script>
+<%+footer%>

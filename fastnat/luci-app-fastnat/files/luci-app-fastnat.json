@@ -1,0 +1,14 @@
+{
+    "luci-app-fastnat": {
+        "description": "Grant access to Fastnat (SFE) configuration",
+        "read": {
+            "uci": [ "fastnat" ],
+            "ubus": {
+                "fwx": [ "common" ]
+            }
+        },
+        "write": {
+            "uci": [ "fastnat" ]
+        }
+    }
+}
