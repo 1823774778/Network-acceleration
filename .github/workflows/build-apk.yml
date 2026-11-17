@@ -1,0 +1,83 @@
+name: Build OpenWrt apk
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h
+
+      - name: Clone OpenWrt 25.12
+        run: |
+          git clone --depth 1 -b openwrt-25.12 \
+            https://github.com/openwrt/openwrt.git openwrt
+
+      - name: Install package and kernel hook
+        run: |
+          cp -r luci-app-fastnat openwrt/package/
+          cp luci-app-fastnat/kernel-patches/952-net-netfilter-shortcut-fe-hook.patch \
+             openwrt/target/linux/generic/hack-6.12/
+
+      - name: Configure
+        run: |
+          cd openwrt
+          ./scripts/feeds update luci
+          ./scripts/feeds install -a -p luci
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq60xx=y
+          CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qihoo_360v6=y
+          CONFIG_PACKAGE_luci-app-fastnat=y
+          CONFIG_USE_APK=y
+          EOF
+          make defconfig
+          grep -E "CONFIG_(TARGET_qualcommax|PACKAGE_luci-app-fastnat|USE_APK)" .config
+
+      - name: Build
+        run: |
+          cd openwrt
+          make -j"$(nproc)" V=s 2>&1 | tee ../build.log
+
+      - name: Collect apk
+        if: success()
+        run: |
+          mkdir -p artifacts
+          find openwrt/bin \
+            \( -name 'luci-app-fastnat*.apk' \
+               -o -name 'fastnatd*.apk' \
+               -o -name 'kmod-fastnat*.apk' \) \
+            -exec cp -v {} artifacts/ \;
+          ls -lh artifacts
+
+      - name: Upload apk
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastnat-apk-ipq60xx
+          path: artifacts/*.apk
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
