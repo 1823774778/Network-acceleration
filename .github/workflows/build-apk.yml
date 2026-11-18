@@ -44,16 +44,33 @@ jobs:
           CONFIG_TARGET_qualcommax=y
           CONFIG_TARGET_qualcommax_ipq60xx=y
           CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qihoo_360v6=y
+          CONFIG_PACKAGE_luci-base=y
+          CONFIG_PACKAGE_luci-lua-runtime=y
+          CONFIG_PACKAGE_luci-compat=y
+          CONFIG_PACKAGE_luci-lib-jsonc=y
           CONFIG_PACKAGE_luci-app-fastnat=y
+          CONFIG_PACKAGE_fastnatd=y
+          CONFIG_PACKAGE_kmod-fastnat=y
           CONFIG_USE_APK=y
           EOF
           make defconfig
-          grep -E "CONFIG_(TARGET_qualcommax|PACKAGE_luci-app-fastnat|USE_APK)" .config
+          for sym in \
+            CONFIG_PACKAGE_luci-app-fastnat \
+            CONFIG_PACKAGE_fastnatd \
+            CONFIG_PACKAGE_kmod-fastnat \
+            CONFIG_USE_APK; do
+            grep -q "^${sym}=y" .config || { echo "missing ${sym}"; exit 1; }
+          done
 
       - name: Build
         run: |
+          set -o pipefail
           cd openwrt
-          make -j"$(nproc)" V=s 2>&1 | tee ../build.log
+          make -j"$(nproc)" target/linux/compile V=s 2>&1 | tee ../build.log
+          make -j"$(nproc)" package/luci-app-fastnat/compile V=s 2>&1 | tee -a ../build.log
+          kcfg=$(ls build_dir/target-*/linux-*/linux-*/.config | head -1)
+          grep -q '^CONFIG_SHORTCUT_FE=y' "$kcfg"
+          grep -q '^CONFIG_PACKAGE_kmod-fastnat=y' .config
 
       - name: Collect apk
         if: success()
